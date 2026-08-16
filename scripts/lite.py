@@ -41,6 +41,8 @@ def main():
             logo = re.search(r'tvg-logo="([^"]*)"', attrs)
             ua = re.search(r'http-user-agent="([^"]*)"', attrs)
             ref = re.search(r'http-referer="([^"]*)"', attrs)
+            catch = re.search(r'catchup="([^"]*)"', attrs)
+            csrc = re.search(r'catchup-source="([^"]*)"', attrs)
             url = None
             j = i + 1
             while j < len(lines) and lines[j].startswith("http"):
@@ -55,6 +57,8 @@ def main():
                     "logo": logo.group(1) if logo else "",
                     "ua": ua.group(1) if ua else None,
                     "ref": ref.group(1) if ref else None,
+                    "catchup": catch.group(1) if catch else None,
+                    "catchup-source": csrc.group(1) if csrc else None,
                     "url": url,
                 })
             i = j
@@ -86,6 +90,10 @@ def main():
             attrs += f' http-user-agent="{e["ua"]}"'
         if e["ref"]:
             attrs += f' http-referer="{e["ref"]}"'
+        if e["catchup"]:
+            attrs += f' catchup="{e["catchup"]}"'
+            if e["catchup-source"]:
+                attrs += f' catchup-source="{e["catchup-source"]}"'
         attrs += f' group-title="{e["group"]}",{e["name"]}'
         out.append("#EXTINF:-1" + attrs)
         out.append(e["url"])

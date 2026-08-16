@@ -121,6 +121,8 @@ def parse(m3u):
         logo = re.search(r'tvg-logo="([^"]*)"', attrs)
         ua = re.search(r'http-user-agent="([^"]*)"', attrs)
         ref = re.search(r'http-referer="([^"]*)"', attrs)
+        catch = re.search(r'catchup="([^"]*)"', attrs)
+        csrc = re.search(r'catchup-source="([^"]*)"', attrs)
         url = next(
             (u.rstrip("\r") for u in lines[i + 1:i + 4]
              if u.rstrip("\r").startswith("http")),
@@ -134,6 +136,8 @@ def parse(m3u):
                 "logo": logo.group(1) if logo else "",
                 "ua": ua.group(1) if ua else None,
                 "ref": ref.group(1) if ref else None,
+                "catchup": catch.group(1) if catch else None,
+                "catchup-source": csrc.group(1) if csrc else None,
                 "url": url,
             })
     return entries
@@ -370,6 +374,9 @@ def main():
                 c["id"] = e["id"]
             if not c.get("logo") and e["logo"]:
                 c["logo"] = e["logo"]
+            if not c.get("catchup") and e.get("catchup"):
+                c["catchup"] = e["catchup"]
+                c["catchup-source"] = e.get("catchup-source")
             if e["url"] not in [u for _, u in c["urls"]]:
                 c["urls"].append((src, e["url"]))
                 url_meta.setdefault(e["url"], {"ua": e["ua"] or DEFAULT_UA, "ref": e["ref"]})
@@ -463,6 +470,10 @@ def main():
                 attrs += f' http-user-agent="{m["ua"]}"'
             if m.get("ref"):
                 attrs += f' http-referer="{m["ref"]}"'
+            if c.get("catchup"):
+                attrs += f' catchup="{c["catchup"]}"'
+                if c.get("catchup-source"):
+                    attrs += f' catchup-source="{c["catchup-source"]}"'
             attrs += f' group-title="{cat}",{c["name"]}'
             m3u.append("#EXTINF:-1" + attrs)
             m3u.extend(picked)
