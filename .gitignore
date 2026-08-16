@@ -1,0 +1,3 @@
+# 上游下载缓存(由 merge.py 生成)
+cache/
+__pycache__/

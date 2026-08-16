@@ -1,0 +1,46 @@
+name: update-iptv
+
+on:
+  schedule:
+    # 每 6 小时(避开整点);zbds 上游就是 6h 一更,Guovin 每天两更
+    - cron: "17 */6 * * *"
+  workflow_dispatch:          # 手动触发: Actions 页 → Run workflow
+  push:
+    paths: ["scripts/**", "config/**", "upstreams.json", ".github/workflows/update.yml"]
+
+permissions:
+  contents: write             # 自动提交产物
+
+concurrency:
+  group: update-iptv
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build playlists
+        # --no-validate: GitHub Runner 在境外,对中国 IPTV 流做逐流探测会误杀,
+        # 这里只做结构性合并;真正可用性由本地校验的基线 + 播放器多候选兜底。
+        run: |
+          python scripts/merge.py --no-validate
+          python scripts/lite.py
+
+      - name: Commit updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tv/
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: refresh IPTV playlists ($(date -u +%Y-%m-%dT%H:%MZ))"
+          git push
