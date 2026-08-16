@@ -4,6 +4,7 @@
 Usage:
     python scripts/merge.py                    # HTTP liveness (default, fast)
     python scripts/merge.py --validate probe   # deep: download a segment & ffprobe real resolution
+    python scripts/merge.py --validate speed   # measure throughput, fast-first order + write order.json
     python scripts/merge.py --no-validate      # structural only (CI / overseas runners)
 
 Config: upstreams.json (upstreams / epg / http_proxy / max_candidates / min_resolution)
@@ -16,6 +17,9 @@ Validation modes:
     probe   — 再下载一个 TS 分片 ffprobe 实测分辨率, 按分辨率给候选排序(高清在前)
               不做硬剔除: 免费源分段取流常因防热链/瞬时波动返回 4xx, 硬剔除会误杀
               (曾把可播的 CCTV5 判死)。死流剔除由 http 阶段负责。(本地低频跑)
+    speed   — 实测每个候选的吞吐, 快源排前, 并写 config/order.json。
+              CI(--no-validate)读取 order.json, 使境外 Runner 的产物保持本地测速顺序。
+              建议在本地(国内网络)周期性跑一次刷新顺序。
 """
 import argparse
 import concurrent.futures
@@ -321,10 +325,64 @@ def probe_resolution(url, meta, proxy):
     return (h, "ok") if h > 0 else (0, "unknown")
 
 
+def _download_speed(url, meta, proxy, window):
+    """下载一个文件 window 秒, 返回 KB/s(失败=0)。"""
+    fd, tmp = tempfile.mkstemp(dir=CACHE, suffix=".bin")
+    os.close(fd)
+    try:
+        t0 = time.time()
+        cmd = curl_base(proxy) + [
+            "--max-time", str(window), "--max-filesize", "15000000",
+            "-A", meta["ua"], "-o", tmp,
+        ]
+        if meta.get("ref"):
+            cmd += ["-e", meta["ref"]]
+        cmd.append(url)
+        subprocess.run(cmd, capture_output=True, timeout=window + 5)
+        dt = time.time() - t0
+        sz = os.path.getsize(tmp)
+        if dt <= 0 or sz <= 0:
+            return 0.0
+        return sz / 1024.0 / dt   # KB/s
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def measure_speed(url, meta, proxy, window=4):
+    """实测吞吐: 取 HLS 的一个分片(或 FLV 直流)下载 window 秒, 返回 KB/s(失败=0)。"""
+    head = _curl_bin(url, meta, proxy, range_="0-3")
+    if head.startswith(b"FLV"):                       # 直连 FLV
+        return _download_speed(url, meta, proxy, window)
+    if not head.startswith(b"#"):
+        return 0.0
+    body = _curl_text(url, meta, proxy)
+    if not body.startswith("#"):
+        return 0.0
+    lines = body.splitlines()
+    seg = None
+    if "#EXT-X-STREAM-INF" in body:                   # master → 第一个变体
+        for i, l in enumerate(lines):
+            if l.startswith("#EXT-X-STREAM-INF"):
+                seg = lines[i + 1]
+                break
+    else:                                             # media → 第一个分片
+        for l in lines:
+            if l and not l.startswith("#"):
+                seg = l
+                break
+    if not seg:
+        return 0.0
+    return _download_speed(urllib.parse.urljoin(url, seg), meta, proxy, window)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--validate", choices=["none", "http", "probe"], default="http",
-                    help="none=跳过(CI), http=HTTP+内容校验(默认), probe=ffprobe实测分辨率并排序候选(不硬剔除)")
+    ap.add_argument("--validate", choices=["none", "http", "probe", "speed"], default="http",
+                    help="none=跳过(CI), http=HTTP+内容校验(默认), probe=ffprobe实测分辨率排序, "
+                         "speed=实测吞吐排序并写 config/order.json(CI 读它保序)")
     ap.add_argument("--no-validate", action="store_true", help="等价于 --validate none")
     args = ap.parse_args()
     mode = "none" if args.no_validate else args.validate
@@ -337,8 +395,15 @@ def main():
     blacklist = load_blacklist()
     whitelist = load_whitelist()
     epg = cfg.get("epg", "")
+    # 本地测速得到的每台候选排序(CI --no-validate 时读取以保持顺序不丢)
+    order_path = os.path.join(ROOT, "config", "order.json")
+    learned = {}
+    if os.path.exists(order_path):
+        with open(order_path, encoding="utf-8") as f:
+            learned = json.load(f)
     print(f"upstreams: {[u['name'] for u in cfg['upstreams']]} | validate={mode}"
-          f" | max_candidates={max_cands} | min_resolution={min_res}", flush=True)
+          f" | max_candidates={max_cands} | min_resolution={min_res}"
+          f" | learned_order={len(learned)} channels", flush=True)
 
     # 1) 下载上游
     files = {}
@@ -365,7 +430,7 @@ def main():
                 continue
             if blacklist and any(b in key for b in blacklist):
                 continue
-            c = channels.setdefault(key, {"name": e["name"], "urls": []})
+            c = channels.setdefault(key, {"name": e["name"], "key": key, "urls": []})
             cand = classify(e)
             if c.get("rank", 99) > CAT_ORDER.get(cand, 99):
                 c["rank"] = CAT_ORDER.get(cand, 99)
@@ -387,7 +452,8 @@ def main():
 
     # 3) 校验
     alive = set(all_urls)
-    res_map = {}   # probe 模式填充: url -> 实测高度(0=未知)
+    res_map = {}     # probe 模式填充: url -> 实测高度(0=未知)
+    speed_map = {}   # speed 模式填充: url -> 实测吞吐 KB/s(0=未知)
     if mode == "none":
         print("validate: skipped", flush=True)
     else:
@@ -438,6 +504,30 @@ def main():
                 ok = sum(1 for u in alive)
                 print(f"  probe alive (video, res>=min or whitelist): {ok}/{len(all_urls)}", flush=True)
 
+        elif mode == "speed":
+            print(f"validate[speed]: stage2 实测吞吐 ({len(alive)} URLs) ...", flush=True)
+
+            def spd(u):
+                return u, measure_speed(u, url_meta.get(u, {"ua": DEFAULT_UA, "ref": None}), proxy)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+                for i, (u, k) in enumerate(ex.map(spd, sorted(alive))):
+                    speed_map[u] = k
+                    if (i + 1) % 100 == 0:
+                        fast = sum(1 for v in speed_map.values() if v >= 200)
+                        print(f"  speed {i + 1}/{len(alive)}, >=200KB/s: {fast}", flush=True)
+            # 写 config/order.json: 每台候选按实测吞吐降序, 供 CI(--no-validate)读取保持顺序
+            learned = {}
+            for key, c in channels.items():
+                urls = sorted((u for s, u in c["urls"] if u in alive),
+                              key=lambda u: -speed_map.get(u, 0.0))
+                learned[key] = urls
+            with open(order_path, "w", encoding="utf-8") as f:
+                json.dump(learned, f, ensure_ascii=False, indent=0)
+            vals = [v for v in speed_map.values() if v > 0]
+            print(f"  speed 完成: 平均 {sum(vals) / max(len(vals), 1):.0f} KB/s"
+                  f" (有吞吐 {len(vals)}/{len(speed_map)})", flush=True)
+
     # 4) 输出 m3u + txt
     priority = {"zbds": 0, "guovin": 1, "aptv": 2}
     os.makedirs(os.path.join(ROOT, "tv"), exist_ok=True)
@@ -452,9 +542,17 @@ def main():
         for c in sorted((c for c in channels.values() if c["cat"] == cat),
                         key=lambda c: c["name"]):
             c["urls"].sort(key=lambda su: (priority.get(su[0], 9), su[1]))
-            if res_map:   # probe 模式: 实测分辨率高的候选排前面
+            if res_map:   # probe 模式: 分辨率优先
                 c["urls"].sort(key=lambda su: (-res_map.get(su[1], 0),
                                                priority.get(su[0], 9), su[1]))
+            if speed_map: # speed 模式: 吞吐优先
+                c["urls"].sort(key=lambda su: (-speed_map.get(su[1], 0.0),
+                                               priority.get(su[0], 9), su[1]))
+            # order.json(learned): 任何模式都应用, 保持本地测速得到的"快源在前"顺序
+            learned_list = learned.get(c.get("key"), [])
+            if learned_list:
+                pos = {u: i for i, u in enumerate(learned_list)}
+                c["urls"].sort(key=lambda su: (pos.get(su[1], 999), su[1]))
             picked = [u for s, u in c["urls"] if u in alive][:max_cands]
             if not picked:
                 continue
