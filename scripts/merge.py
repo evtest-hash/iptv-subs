@@ -10,7 +10,10 @@ Usage:
 Config: upstreams.json (upstreams / epg / http_proxy / max_candidates / min_resolution)
         config/alias.txt (台名归一) · blacklist.txt (剔除) · whitelist.txt (低清也保留的分类)
         config/order.txt (频道显示顺序, 未列出者自然序排尾; 卫视省台序在此维护)
-Output: tv/iptv.m3u (播放器) + tv/iptv.txt (TVBox 格式)
+        config/vod.txt (文件型点播 URL 子串, 命中移入 tv/vod.m3u; 电影循环流不列入)
+Output: tv/iptv.m3u (直播播放器) + tv/iptv.txt (TVBox) + tv/vod.m3u (点播/归档, 与直播分离)
+tvg-id: 不再透传上游源 id(zbds 内部数字 id 冲突且失稳), 统一按 EPG 命中 > 规范名分配,
+        恒输出 tvg-name; EPG 抓取为加分项, best-effort, 失败静默回退规范名, 不影响直播。
 
 Validation modes:
     none    — keep every URL (CI; 境外 Runner 对中国流探测会失真)
@@ -24,6 +27,7 @@ Validation modes:
 """
 import argparse
 import concurrent.futures
+import html
 import json
 import os
 import re
@@ -33,6 +37,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE = os.path.join(ROOT, "cache")
@@ -90,6 +95,43 @@ def load_order():
     return pos
 
 
+def load_vod():
+    """vod.txt: 文件型点播 URL 子串(每行一个, # 注释)。
+
+    频道全部候选 URL 命中任一子串即视为点播, 从 live 列表移入 tv/vod.m3u。
+    电影循环流(live.metshop.top 等)不列入, 保留在直播列表。"""
+    return read_lines(os.path.join(ROOT, "config", "vod.txt"))
+
+
+def fetch_epg_ids(epg_url, timeout=10):
+    """抓 EPG 建 norm(显示名)->tvg-id 表。best-effort: 任何失败返回空 dict。
+
+    51zmt 的 :8000 端口实为 http, 302 重定向到 https s.102031.xyz, urllib 跟随。
+    https 直连失败时自动换 http 变体重试。仅作加分项: 失败静默回退规范名,
+    绝不影响直播列表生成。"""
+    if not epg_url:
+        return {}
+    tries = [epg_url]
+    if epg_url.startswith("https://"):
+        tries.append("http://" + epg_url[len("https://"):])
+    for url in tries:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = r.read(800000)
+            epg = {}
+            for m in re.finditer(
+                r'<channel[^>]*id="([^"]*)"[^>]*>\s*<display-name[^>]*>([^<]*)</display-name>',
+                data.decode("utf-8", "ignore"),
+            ):
+                epg.setdefault(norm(m.group(2)), m.group(1))
+            if epg:
+                return epg
+        except Exception:
+            continue
+    return {}
+
+
 def curl_base(proxy):
     cmd = ["curl", "-sS", "-L"]
     if proxy:
@@ -111,6 +153,23 @@ def fetch(name, url, ua, proxy, retries=3):
         sys.stderr.write(f"  [warn] {name} download attempt {attempt} failed\n")
         time.sleep(2 * attempt)
     return None
+
+
+def clean_url(u):
+    """清洗 URL: 去尾部空白/引号, 去 # 后重复完整 URL 片段, HTML 实体反复反解。
+
+    保留 query 参数(?zzhed 等可能是防盗链必需)。"""
+    u = u.strip().rstrip('"')
+    if "#" in u:
+        head, _, frag = u.partition("#")
+        if "://" in frag:
+            u = head
+    for _ in range(3):
+        nxt = html.unescape(u)
+        if nxt == u:
+            break
+        u = nxt
+    return u
 
 
 def parse(m3u):
@@ -137,8 +196,8 @@ def parse(m3u):
         catch = re.search(r'catchup="([^"]*)"', attrs)
         csrc = re.search(r'catchup-source="([^"]*)"', attrs)
         url = next(
-            (u.rstrip("\r") for u in lines[i + 1:i + 4]
-             if u.rstrip("\r").startswith("http")),
+            (clean_url(u) for u in lines[i + 1:i + 4]
+             if u.startswith("http")),
             None,
         )
         if url:
@@ -413,7 +472,9 @@ def main():
     blacklist = load_blacklist()
     whitelist = load_whitelist()
     order_pos = load_order()
+    vod_subs = load_vod()
     epg = cfg.get("epg", "")
+    epg_ids = fetch_epg_ids(epg)   # 加分项: best-effort, 失败返回空, 不影响产物
     # 本地测速得到的每台候选排序(CI --no-validate 时读取以保持顺序不丢)
     order_path = os.path.join(ROOT, "config", "order.json")
     learned = {}
@@ -422,7 +483,8 @@ def main():
             learned = json.load(f)
     print(f"upstreams: {[u['name'] for u in cfg['upstreams']]} | validate={mode}"
           f" | max_candidates={max_cands} | min_resolution={min_res}"
-          f" | learned_order={len(learned)} channels", flush=True)
+          f" | learned_order={len(learned)} channels | epg_ids={len(epg_ids)}"
+          f" | vod_subs={len(vod_subs)}", flush=True)
 
     # 1) 下载上游
     files = {}
@@ -454,8 +516,7 @@ def main():
             if c.get("rank", 99) > CAT_ORDER.get(cand, 99):
                 c["rank"] = CAT_ORDER.get(cand, 99)
                 c["cat"] = cand
-            if not c.get("id") and e["id"]:
-                c["id"] = e["id"]
+            # 不再透传上游源 id(zbds 内部数字 id 既冲突又失稳), tvg-id 在输出阶段统一分配
             if not c.get("logo") and e["logo"]:
                 c["logo"] = e["logo"]
             if not c.get("catchup") and e.get("catchup"):
@@ -464,6 +525,12 @@ def main():
             if e["url"] not in [u for _, u in c["urls"]]:
                 c["urls"].append((src, e["url"]))
                 url_meta.setdefault(e["url"], {"ua": e["ua"] or DEFAULT_UA, "ref": e["ref"]})
+
+    # VOD 判定: 全部候选 URL 命中 vod.txt 子串 → 点播, 从 live 移入 vod.m3u
+    # (不能"任一命中即判": 东方卫视首候选是 kwimgs 点播文件但有直播兜底, 仍算直播)
+    for c in channels.values():
+        c["vod"] = bool(c["urls"]) and all(
+            any(s in u for s in vod_subs) for _, u in c["urls"])
 
     all_urls = sorted({u for c in channels.values() for _, u in c["urls"]})
     url_cat = {u: c.get("cat", "") for c in channels.values() for _, u in c["urls"]}
@@ -547,17 +614,19 @@ def main():
             print(f"  speed 完成: 平均 {sum(vals) / max(len(vals), 1):.0f} KB/s"
                   f" (有吞吐 {len(vals)}/{len(speed_map)})", flush=True)
 
-    # 4) 输出 m3u + txt
+    # 4) 输出 m3u + txt (live) + vod.m3u (点播/归档)
     priority = {"zbds": 0, "guovin": 1, "aptv": 2}
     os.makedirs(os.path.join(ROOT, "tv"), exist_ok=True)
     m3u = [f'#EXTM3U x-tvg-url="{epg}"']
     txt = []          # TVBox 格式: 分类,#genre# + name,url1#url2
+    vod = [f'#EXTM3U x-tvg-url="{epg}"', "# 点播/归档(非直播, 由 merge.py 从 live 列表分离)"]
     stats = {}
     kept = 0
+    vod_n = 0
+    used_tids = set()
     for cat in sorted({c["cat"] for c in channels.values()},
                       key=lambda x: CAT_ORDER.get(x, 99)):
-        stats[cat] = 0
-        txt.append(f"{cat},#genre#")
+        cat_live, cat_vod = [], []
         # 组内排序: order.txt 指定者按其顺序, 未指定者自然序排尾
         for c in sorted((c for c in channels.values() if c["cat"] == cat),
                         key=lambda c: (order_pos.get(c["key"], len(order_pos)),
@@ -577,11 +646,14 @@ def main():
             picked = [u for s, u in c["urls"] if u in alive][:max_cands]
             if not picked:
                 continue
-            kept += 1
-            stats[cat] += 1
-            attrs = ""
-            if c.get("id"):
-                attrs += f' tvg-id="{c["id"]}"'
+            # tvg-id: EPG 命中 > 规范名, 全表唯一性兜底(加分项, 失败不影响直播)
+            tid = epg_ids.get(c["key"]) or epg_ids.get(norm(c["name"])) or c["key"]
+            base, n = tid, 2
+            while tid in used_tids:
+                tid = f"{base}-{n}"
+                n += 1
+            used_tids.add(tid)
+            attrs = f' tvg-id="{tid}" tvg-name="{c["name"]}"'
             if c.get("logo"):
                 attrs += f' tvg-logo="{c["logo"]}"'
             m = url_meta.get(picked[0], {})
@@ -594,17 +666,35 @@ def main():
                 if c.get("catchup-source"):
                     attrs += f' catchup-source="{c["catchup-source"]}"'
             attrs += f' group-title="{cat}",{c["name"]}'
-            m3u.append("#EXTINF:-1" + attrs)
-            m3u.extend(picked)
-            txt.append(f'{c["name"]},{"#".join(picked)}')
+            if c.get("vod"):
+                cat_vod.append((attrs, picked))
+            else:
+                cat_live.append((attrs, picked, c["name"]))
+        if cat_live:
+            txt.append(f"{cat},#genre#")
+            for attrs, picked, name in cat_live:
+                kept += 1
+                stats[cat] = stats.get(cat, 0) + 1
+                m3u.append("#EXTINF:-1" + attrs)
+                m3u.extend(picked)
+                txt.append(f'{name},{"#".join(picked)}')
+        if cat_vod:
+            vod.append(f"# === {cat} ===")
+            for attrs, picked in cat_vod:
+                vod_n += 1
+                vod.append("#EXTINF:-1" + attrs)
+                vod.extend(picked)
 
     m3u_path = os.path.join(ROOT, "tv", "iptv.m3u")
     txt_path = os.path.join(ROOT, "tv", "iptv.txt")
+    vod_path = os.path.join(ROOT, "tv", "vod.m3u")
     with open(m3u_path, "w", encoding="utf-8") as f:
         f.write("\n".join(m3u) + "\n")
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(txt) + "\n")
-    print(f"wrote tv/iptv.m3u ({kept} channels) + tv/iptv.txt", flush=True)
+    with open(vod_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(vod) + "\n")
+    print(f"wrote tv/iptv.m3u ({kept} live) + tv/iptv.txt + tv/vod.m3u ({vod_n} VOD)", flush=True)
     for g in sorted(stats, key=lambda x: CAT_ORDER.get(x, 99)):
         if stats[g]:
             print(f"  {g}: {stats[g]}")

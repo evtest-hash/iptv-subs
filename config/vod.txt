@@ -1,0 +1,17 @@
+# 文件型点播/归档 URL 子串: 每行一个, # 开头为注释。
+# 判定规则: 频道的【全部】候选 URL 命中任一子串 → 视为点播, 从直播列表移入 tv/vod.m3u。
+# 注意: 电影循环流(live.metshop.top 等)不列入 —— 它们是持续在线的"电影台", 保留在直播列表。
+# 新出现的主机想移出直播时, 在此追加一行即可。
+vip.ffzy
+jsmov2.a.yximgs.com
+alimov2.a.kwimgs.com
+txmov2.a.kwimgs.com
+cdn8.yzzy-online.com
+bdstatic.com
+res.cctvnews.cctv.com
+v.lzcdn28.com
+jiaojirentv.top
+43.138.0.72
+svip.high24-playback.com
+vzan.com
+173.208.234.146

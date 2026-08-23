@@ -39,6 +39,7 @@ def main():
             name = attrs.rsplit(",", 1)[-1].strip()
             g = re.search(r'group-title="([^"]*)"', attrs)
             tid = re.search(r'tvg-id="([^"]*)"', attrs)
+            tname = re.search(r'tvg-name="([^"]*)"', attrs)
             logo = re.search(r'tvg-logo="([^"]*)"', attrs)
             ua = re.search(r'http-user-agent="([^"]*)"', attrs)
             ref = re.search(r'http-referer="([^"]*)"', attrs)
@@ -55,6 +56,7 @@ def main():
                     "name": name,
                     "group": g.group(1) if g else "特色",
                     "id": tid.group(1) if tid else "",
+                    "tname": tname.group(1) if tname else "",
                     "logo": logo.group(1) if logo else "",
                     "ua": ua.group(1) if ua else None,
                     "ref": ref.group(1) if ref else None,
@@ -86,6 +88,8 @@ def main():
         attrs = ""
         if e["id"]:
             attrs += f' tvg-id="{e["id"]}"'
+        if e["tname"]:
+            attrs += f' tvg-name="{e["tname"]}"'
         if e["logo"]:
             attrs += f' tvg-logo="{e["logo"]}"'
         if e["ua"]:
