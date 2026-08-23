@@ -3,7 +3,8 @@
 
 Keeps the whole 央视 / 卫视 / 港澳台 groups, trims 地方 to one channel per
 2-char city prefix, and preserves per-entry http-user-agent / http-referer
-so players fetch 凤凰 etc. with the right UA.
+so players fetch 凤凰 etc. with the right UA. Channel order is inherited
+from the merged m3u (merge.py 已按 order.txt + 自然序排好), 不再重排。
 
 Usage:
     python scripts/lite.py [--in tv/iptv.m3u] [--out tv/iptv_lite.m3u]
@@ -76,7 +77,8 @@ def main():
             seen_city.add(city)
         kept.append(e)
 
-    kept.sort(key=lambda e: (CAT_ORDER.get(e["group"], 99), e["name"]))
+    # 不重排: 输入是 merge.py 的产物, 已按 CAT_ORDER + order.txt + 自然序排好,
+    # 此处再按名字重排会打乱央视数字序和卫视省台序。
 
     out = [header]
     stats = {}

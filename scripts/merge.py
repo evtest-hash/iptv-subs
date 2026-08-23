@@ -9,6 +9,7 @@ Usage:
 
 Config: upstreams.json (upstreams / epg / http_proxy / max_candidates / min_resolution)
         config/alias.txt (台名归一) · blacklist.txt (剔除) · whitelist.txt (低清也保留的分类)
+        config/order.txt (频道显示顺序, 未列出者自然序排尾; 卫视省台序在此维护)
 Output: tv/iptv.m3u (播放器) + tv/iptv.txt (TVBox 格式)
 
 Validation modes:
@@ -79,6 +80,14 @@ def load_blacklist():
 
 def load_whitelist():
     return set(read_lines(os.path.join(ROOT, "config", "whitelist.txt")))
+
+
+def load_order():
+    """order.txt: 频道显示顺序(每行一个台名, 未列出者自然序排尾)。"""
+    pos = {}
+    for i, line in enumerate(read_lines(os.path.join(ROOT, "config", "order.txt"))):
+        pos[norm(line)] = i
+    return pos
 
 
 def curl_base(proxy):
@@ -154,6 +163,15 @@ def norm(name):
         if n.endswith(suf):
             n = n[:-len(suf)]
     return n
+
+
+def natural_key(name):
+    """自然排序键: 数字段按数值比较, 其余按字符。
+
+    让 CCTV1 < CCTV2 < ... < CCTV10 < ... < CCTV17, 而非字符串序的
+    CCTV1 < CCTV10 < CCTV2。拆出的数字/非数字段交替, 比较时同索引类型一致,
+    不会触发 int vs str 的 TypeError。"""
+    return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", name)]
 
 
 def classify(e):
@@ -394,6 +412,7 @@ def main():
     alias_map = load_alias()
     blacklist = load_blacklist()
     whitelist = load_whitelist()
+    order_pos = load_order()
     epg = cfg.get("epg", "")
     # 本地测速得到的每台候选排序(CI --no-validate 时读取以保持顺序不丢)
     order_path = os.path.join(ROOT, "config", "order.json")
@@ -539,8 +558,10 @@ def main():
                       key=lambda x: CAT_ORDER.get(x, 99)):
         stats[cat] = 0
         txt.append(f"{cat},#genre#")
+        # 组内排序: order.txt 指定者按其顺序, 未指定者自然序排尾
         for c in sorted((c for c in channels.values() if c["cat"] == cat),
-                        key=lambda c: c["name"]):
+                        key=lambda c: (order_pos.get(c["key"], len(order_pos)),
+                                       natural_key(c["name"]))):
             c["urls"].sort(key=lambda su: (priority.get(su[0], 9), su[1]))
             if res_map:   # probe 模式: 分辨率优先
                 c["urls"].sort(key=lambda su: (-res_map.get(su[1], 0),
